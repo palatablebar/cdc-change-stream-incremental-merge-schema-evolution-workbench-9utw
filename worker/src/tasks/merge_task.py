@@ -19,6 +19,7 @@ from src.models.merge_run import MergeRun
 from src.models.merge_target import MergeTarget
 from src.models.rejected_event import RejectedEvent
 from src.services.merge_engine import compute_merge
+from src.services.schema_service import load_version_rules
 from src.utils.logger import get_logger
 from src.utils.redis_client import get_redis
 
@@ -95,12 +96,14 @@ def merge_run_task(self, run_id: str) -> dict[str, Any]:
             ]
             _progress(run_id, "merging", {"events": len(payload)})
 
+            schema_rules = load_version_rules(db, stream.id)
             result = compute_merge(
                 payload,
                 pk_column=stream.pk_column,
                 strategy=strategy,
                 window_start=run.window_start_lsn,
                 window_end=run.window_end_lsn,
+                schema_rules=schema_rules,
             )
             _progress(run_id, "persisting", result["counts"])
 

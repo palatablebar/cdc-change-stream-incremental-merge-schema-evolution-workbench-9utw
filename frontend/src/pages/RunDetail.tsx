@@ -166,6 +166,14 @@ export const RunDetailPage = () => {
                       {result?.amount_audit.checked ?? 0} 项 / 不一致 {result?.amount_audit.mismatched ?? 0}
                     </td>
                   </tr>
+                  <tr>
+                    <td>按位点选用的规则版本</td>
+                    <td className="num mono tiny">
+                      {Object.entries(result?.rule_selection ?? {})
+                        .map(([label, count]) => `${label}:${count}`)
+                        .join(' · ') || '—'}
+                    </td>
+                  </tr>
                 </tbody>
               </table>
             </div>
@@ -215,6 +223,7 @@ export const RunDetailPage = () => {
                 <th>主键</th>
                 <th className="num">最后 LSN</th>
                 <th>op</th>
+                <th>规则版本</th>
                 <th>重建</th>
                 <th>最终值</th>
               </tr>
@@ -225,6 +234,7 @@ export const RunDetailPage = () => {
                   <td className="mono tiny">{row.pk}</td>
                   <td className="num">{formatLsn(row.last_lsn)}</td>
                   <td className="tiny">{row.op}</td>
+                  <td className="tiny mono faint">{row.schema_version ?? '—'}</td>
                   <td className="tiny faint">{row.rebuilt ? '是' : '否'}</td>
                   <td className="tiny mono" style={{ maxWidth: 560, wordBreak: 'break-all' }}>
                     {displayValue(row.values, 160)}

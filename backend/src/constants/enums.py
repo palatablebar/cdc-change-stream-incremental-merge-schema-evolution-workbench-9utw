@@ -36,12 +36,17 @@ class RunStatus(str, Enum):
 
 
 class RejectReason(str, Enum):
-    """拒绝事件原因枚举，决定重放修复策略。"""
+    """拒绝事件原因枚举，决定重放修复策略。
+
+    out_of_range 是 schema 发布/归并时按「该事件位点对应的版本」校验出的越界值，
+    与上游本身投递坏载荷的 type_conflict / parse_error 分开统计。
+    """
 
     SCHEMA_MISMATCH = "schema_mismatch"
     PK_MISSING = "pk_missing"
     PARSE_ERROR = "parse_error"
     TYPE_CONFLICT = "type_conflict"
+    OUT_OF_RANGE = "out_of_range"
 
 
 class RejectStatus(str, Enum):
@@ -92,6 +97,31 @@ class ActorKind(str, Enum):
     WORKER = "worker"
 
 
+class SchemaVersionStatus(str, Enum):
+    """SchemaVersion 的发布状态。
+
+    draft      = 已登记但尚未生效（没有 effective_from_lsn）
+    active     = 已发布，在 effective_from_lsn 之后生效
+    superseded = 已被同一生效位点或更早位点的新版本覆盖
+    rolled_back= 发布失败，已回退，不再参与按位点选规则
+    """
+
+    DRAFT = "draft"
+    ACTIVE = "active"
+    SUPERSEDED = "superseded"
+    ROLLED_BACK = "rolled_back"
+
+    @classmethod
+    def values(cls) -> set[str]:
+        return {member.value for member in cls}
+
+
+class SchemaPublishStatus(str, Enum):
+    PUBLISHED = "published"
+    FAILED = "failed"
+    ROLLED_BACK = "rolled_back"
+
+
 # 枚举中文展示名：后端 formatters / 接口文案共用
 ENUM_LABELS: dict[str, dict[str, str]] = {
     "CdcOp": {"insert": "新增", "update": "更新", "delete": "删除"},
@@ -108,8 +138,20 @@ ENUM_LABELS: dict[str, dict[str, str]] = {
         "pk_missing": "主键缺失",
         "parse_error": "载荷解析失败",
         "type_conflict": "类型冲突",
+        "out_of_range": "数值/长度越界",
     },
     "RejectStatus": {"pending": "待处理", "replayed": "已重放", "dismissed": "已忽略"},
+    "SchemaVersionStatus": {
+        "draft": "未发布",
+        "active": "生效中",
+        "superseded": "已被覆盖",
+        "rolled_back": "已回退",
+    },
+    "SchemaPublishStatus": {
+        "published": "已发布",
+        "failed": "发布失败",
+        "rolled_back": "已回退",
+    },
     "MergeStrategy": {"upsert": "按主键 upsert", "append": "仅追加"},
     "ChangeKind": {
         "add_nullable": "新增可空列",

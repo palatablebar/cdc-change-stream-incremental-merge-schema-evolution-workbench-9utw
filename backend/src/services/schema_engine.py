@@ -16,9 +16,12 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
+from datetime import date, datetime
+from decimal import Decimal, InvalidOperation
 from typing import Any
 
-from src.constants.enums import ChangeKind, CompatLevel
+from src.constants.enums import ChangeKind, CompatLevel, SchemaVersionStatus
 
 # 变更类别 -> 兼容方向
 CHANGE_COMPAT: dict[str, str] = {
@@ -74,6 +77,244 @@ def family_of(base: str) -> str:
     if base in JSON_FAMILY:
         return "json"
     return "unknown"
+
+
+# ---------------------------------------------------------------------------
+# 按「事件自己的位点」选择版本 / 用真实值检查越界
+# ---------------------------------------------------------------------------
+
+INTEGER_BOUNDS: dict[str, tuple[Decimal, Decimal]] = {
+    "smallint": (Decimal("-32768"), Decimal("32767")),
+    "integer": (Decimal("-2147483648"), Decimal("2147483647")),
+    "int": (Decimal("-2147483648"), Decimal("2147483647")),
+    "bigint": (Decimal("-9223372036854775808"), Decimal("9223372036854775807")),
+}
+
+_NUMERIC_NOISE = re.compile(r"[¥$,\s]")
+
+
+def _to_decimal(value: Any) -> Decimal | None:
+    if isinstance(value, bool):
+        return Decimal(int(value))
+    if isinstance(value, Decimal):
+        return value
+    if isinstance(value, (int, float)):
+        try:
+            return Decimal(str(value))
+        except InvalidOperation:  # pragma: no cover - str(int/float) 总能解析
+            return None
+    if isinstance(value, str):
+        text = _NUMERIC_NOISE.sub("", value)
+        try:
+            return Decimal(text)
+        except InvalidOperation:
+            return None
+    return None
+
+
+def numeric_limits(sql_type: str) -> tuple[Decimal | None, Decimal | None, int]:
+    """返回 (最小值, 最大值, 小数位)。非数值类型返回 (None, None, 0)。"""
+    base, params = parse_type(sql_type)
+    if base in NUMERIC_FAMILY:
+        if not params:
+            return None, None, 0
+        precision = params[0]
+        scale = params[1] if len(params) > 1 else 0
+        if precision <= 0:
+            return None, None, scale
+        integer_digits = max(0, precision - scale)
+        unit = Decimal(1).scaleb(-scale)
+        max_abs = (Decimal(10) ** integer_digits) - unit
+        return -max_abs, max_abs, scale
+    if base in INTEGER_BOUNDS:
+        low, high = INTEGER_BOUNDS[base]
+        return low, high, 0
+    return None, None, 0
+
+
+def _format_decimal(value: Decimal | None) -> str:
+    if value is None:
+        return "NULL"
+    return format(value, "f")
+
+
+def _json_value(value: Any) -> Any:
+    """把预检明细里的值转成可写入 JSONB / 返回前端的形式。"""
+    if isinstance(value, Decimal):
+        return format(value, "f")
+    if isinstance(value, (datetime, date)):
+        return value.isoformat()
+    if isinstance(value, (str, int, float, bool)) or value is None:
+        return value
+    if isinstance(value, list):
+        return [_json_value(item) for item in value]
+    if isinstance(value, dict):
+        return {str(key): _json_value(item) for key, item in value.items()}
+    return str(value)
+
+
+def scalar_violation(value: Any, sql_type: str) -> dict[str, str] | None:
+    """检查单个已存在的值是否满足目标列定义。
+
+    返回 {"reason": RejectReason 值, "detail": 说明}；合法返回 None。
+    这是「用真实记录做发布前预检」与「归并没条按位点选规则」共用的纯函数。
+    """
+    if value is None:
+        return None
+    base, params = parse_type(sql_type)
+    family = family_of(base)
+
+    if family in ("numeric", "integer"):
+        number = _to_decimal(value)
+        if number is None:
+            return {
+                "reason": "type_conflict",
+                "detail": f"值 {value!r} 无法解析为 {sql_type}",
+            }
+        if not number.is_finite():
+            return {
+                "reason": "type_conflict",
+                "detail": f"值 {value!r} 不是有限数值，无法写入 {sql_type}",
+            }
+        low, high, scale = numeric_limits(sql_type)
+        if low is not None and high is not None and (number < low or number > high):
+            return {
+                "reason": "out_of_range",
+                "detail": f"值 {value!r} 超出 {sql_type} 允许范围 [{_format_decimal(low)}, {_format_decimal(high)}]",
+            }
+        if family == "integer" and number != number.to_integral_value():
+            return {
+                "reason": "type_conflict",
+                "detail": f"值 {value!r} 不是整数，无法写入 {sql_type}",
+            }
+        if scale and number.as_tuple().exponent < -scale:
+            quantized = number.quantize(Decimal(1).scaleb(-scale))
+            if quantized != number:
+                return {
+                    "reason": "out_of_range",
+                    "detail": f"值 {value!r} 的小数位超过 {sql_type} 的 scale={scale}",
+                }
+        return None
+
+    if family == "text" and params and base not in ("text",):
+        if len(str(value)) > params[0]:
+            return {
+                "reason": "out_of_range",
+                "detail": f"值长度 {len(str(value))} 超出 {sql_type} 上限 {params[0]}",
+            }
+    return None
+
+
+def value_violation(value: Any, field: dict[str, Any]) -> dict[str, str] | None:
+    if value is None:
+        if not bool(field.get("nullable", True)):
+            return {
+                "reason": "schema_mismatch",
+                "detail": f"必填列 {field.get('name')} 不允许为 null",
+            }
+        return None
+    return scalar_violation(value, str(field.get("type", "text")))
+
+
+def validate_record(
+    values: dict[str, Any] | None,
+    fields: list[dict[str, Any]],
+    require_all: bool = True,
+) -> list[dict[str, Any]]:
+    """按给定版本字段校验一条真实记录，返回越界/缺失明细。
+
+    require_all=False 时只校验载荷里实际出现的字段（CDC update 可能只带变化列）。
+    """
+    payload = values or {}
+    violations: list[dict[str, Any]] = []
+    for field in fields or []:
+        name = str(field.get("name", ""))
+        if not name:
+            continue
+        if name not in payload:
+            if (
+                require_all
+                and not bool(field.get("nullable", True))
+                and field.get("default") is None
+            ):
+                violations.append(
+                    {
+                        "column": name,
+                        "value": None,
+                        "type": field.get("type"),
+                        "reason": "schema_mismatch",
+                        "detail": f"缺少必填列 {name}",
+                    }
+                )
+            continue
+        violation = value_violation(payload.get(name), field)
+        if violation:
+            violations.append(
+                {
+                    "column": name,
+                    "value": _json_value(payload.get(name)),
+                    "type": field.get("type"),
+                    **violation,
+                }
+            )
+    return violations
+
+
+def _get(version: Any, key: str, default: Any = None) -> Any:
+    if isinstance(version, dict):
+        return version.get(key, default)
+    return getattr(version, key, default)
+
+
+def _is_effective(version: Any) -> bool:
+    if _get(version, "effective_from_lsn") is None:
+        return False
+    status = _get(version, "status")
+    if status in (None, ""):
+        return True
+    return status not in (
+        SchemaVersionStatus.SUPERSEDED.value,
+        SchemaVersionStatus.ROLLED_BACK.value,
+    )
+
+
+def resolve_version_for_lsn(versions: list[Any], lsn: int) -> Any | None:
+    """按事件位点选择生效版本：取 effective_from_lsn <= lsn 的最新版本。
+
+    - 老版本在边界之前继续生效，新版本从边界（含）开始生效；
+    - 未发布（draft）/已回退（rolled_back）的版本不参与选择；
+    - 如果没有任何版本在 lsn 之前生效，退回最早登记的版本，保证老事件仍有规则可用。
+    """
+    ordered = sorted(
+        versions or [],
+        key=lambda item: (
+            int(_get(item, "effective_from_lsn") or 0),
+            str(_get(item, "created_at") or ""),
+            str(_get(item, "version_label") or ""),
+            str(_get(item, "id") or ""),
+        ),
+    )
+    eligible = [version for version in ordered if _is_effective(version)]
+    if not eligible:
+        return ordered[0] if ordered else None
+    selected = None
+    for version in eligible:
+        if int(_get(version, "effective_from_lsn")) <= int(lsn):
+            selected = version
+        else:
+            break
+    if selected is not None:
+        return selected
+    # 位点早于所有已发布边界：优先退回最早登记的「原始结构」（未设置边界的版本）。
+    baseline = [
+        version
+        for version in ordered
+        if _get(version, "effective_from_lsn") is None
+        and _get(version, "status") != SchemaVersionStatus.ROLLED_BACK.value
+    ]
+    if baseline:
+        return baseline[0]
+    return eligible[0] if eligible else (ordered[0] if ordered else None)
 
 
 def classify_type_change(old_type: str, new_type: str) -> str:
@@ -327,15 +568,15 @@ def _sql_for(change: dict[str, Any], table: str, dialect: str) -> dict[str, Any]
         precheck.append(f"SELECT count(*) FROM {table} WHERE {column} IS NOT NULL;")
         note = "类型放宽，旧数据可被新类型容纳。"
     elif kind == ChangeKind.TYPE_NARROW.value:
-        precheck.append(f"SELECT count(*) FROM {table} WHERE {column} IS NOT NULL;")
-        forward.append(f"-- 收窄前必须确认没有越界值")
+        precheck.append(_precheck_bounds_sql(table, column, str(new.get("type") or "")))
+        forward.append(f"-- 收窄前必须确认没有越界值（预检为 0 才能继续）")
         forward.append(
             f"ALTER TABLE {table} ALTER COLUMN {column} TYPE {new.get('type')} USING {column}::{_base_type(new.get('type'))};"
         )
         rollback.append(
             f"ALTER TABLE {table} ALTER COLUMN {column} TYPE {old.get('type')} USING {column}::{_base_type(old.get('type'))};"
         )
-        note = "类型收窄可能截断/溢出，属破坏性变更。"
+        note = "类型收窄可能截断/溢出，属破坏性变更；预检会按真实值检查边界。"
     elif kind == ChangeKind.TYPE_INCOMPATIBLE.value:
         precheck.append(f"SELECT count(*) FROM {table} WHERE {column} IS NOT NULL;")
         forward.append(f"-- 类型不兼容：{old.get('type')} → {new.get('type')}，需新增列 + 回填 + 切读")
@@ -376,6 +617,25 @@ def _literal(value: Any) -> str:
     if isinstance(value, (int, float)):
         return str(value)
     return "'" + str(value).replace("'", "''") + "'"
+
+
+def _precheck_bounds_sql(table: str, column: str, sql_type: str) -> str:
+    """生成「按真实值检查越界」的预检 SQL，而不是只数非空行。"""
+    base, params = parse_type(sql_type)
+    family = family_of(base)
+    if family in ("numeric", "integer"):
+        low, high, _ = numeric_limits(sql_type)
+        if low is not None and high is not None:
+            return (
+                f"SELECT count(*) AS out_of_range FROM {table} WHERE {column} IS NOT NULL "
+                f"AND ({column} < {_format_decimal(low)} OR {column} > {_format_decimal(high)});"
+            )
+    if family == "text" and params and base != "text":
+        return (
+            f"SELECT count(*) AS out_of_range FROM {table} WHERE {column} IS NOT NULL "
+            f"AND length({column}) > {params[0]};"
+        )
+    return f"SELECT count(*) FROM {table} WHERE {column} IS NOT NULL;"
 
 
 def aggregate_level(levels: list[str]) -> str:

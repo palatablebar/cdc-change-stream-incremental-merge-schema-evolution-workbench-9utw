@@ -20,6 +20,7 @@ import json
 from typing import Any
 
 from src.constants.enums import MergeStrategy
+from src.services.schema_engine import resolve_version_for_lsn, validate_record
 from src.utils.lsn import LsnWindow, first_gap
 
 
@@ -33,12 +34,19 @@ def _numeric(value: Any) -> float | None:
     return None
 
 
+def _rule_get(rule: Any, key: str, default: Any = None) -> Any:
+    if isinstance(rule, dict):
+        return rule.get(key, default)
+    return getattr(rule, key, default)
+
+
 def compute_merge(
     events: list[dict[str, Any]],
     pk_column: str,
     strategy: str = MergeStrategy.UPSERT.value,
     window_start: int = 1,
     window_end: int = 0,
+    schema_rules: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     window = LsnWindow(start=window_start, end=window_end)
 
@@ -55,6 +63,7 @@ def compute_merge(
     amount_audit: dict[str, dict[str, Any]] = {}
 
     inserted = updated = deleted = rebuilt = 0
+    rule_counts: dict[str, int] = {}
 
     for event in ordered:
         lsn = int(event["lsn"])
@@ -107,17 +116,62 @@ def compute_merge(
         after = dict(event.get("after_json") or {})
         before = dict(event.get("before_json") or {})
 
+        # 每条事件按自己的 LSN 选择生效版本；新版本只约束边界之后的事件，
+        # 老事件继续使用老规则，避免「收窄」把补传的老事件误判为越界。
+        rule = resolve_version_for_lsn(schema_rules, lsn) if schema_rules else None
+        rule_label = None
+        if rule is not None:
+            rule_label = str(
+                _rule_get(rule, "version_label") or _rule_get(rule, "version_id") or ""
+            )
+            rule_counts[rule_label] = rule_counts.get(rule_label, 0) + 1
+            if op in ("insert", "update") and after:
+                fields = list(
+                    _rule_get(rule, "fields") or _rule_get(rule, "fields_json") or []
+                )
+                violations = validate_record(after, fields, require_all=False)
+                if violations:
+                    first = violations[0]
+                    detail = "；".join(
+                        f"{item.get('column')}: {item.get('detail')}" for item in violations
+                    )
+                    rejected_events.append(
+                        {
+                            "event_id": str(event.get("id", "")),
+                            "lsn": lsn,
+                            "pk": pk,
+                            "reason": first.get("reason") or "out_of_range",
+                            "detail": detail,
+                            "schema_version": rule_label,
+                            "violations": violations,
+                        }
+                    )
+                    continue
+
         if op == "insert":
             if pk in tombstones:
                 rebuilt += 1
                 tombstones.pop(pk)
-                rows[pk] = {"values": after, "last_lsn": lsn, "op": "insert", "rebuilt": True}
+                rows[pk] = {
+                    "values": after,
+                    "last_lsn": lsn,
+                    "op": "insert",
+                    "rebuilt": True,
+                    "schema_version": rule_label,
+                }
                 inserted += 1
             elif pk in rows:
                 _merge_values(rows[pk], after, before, lsn, conflicts, pk)
+                rows[pk]["schema_version"] = rule_label
                 updated += 1
             else:
-                rows[pk] = {"values": after, "last_lsn": lsn, "op": "insert", "rebuilt": False}
+                rows[pk] = {
+                    "values": after,
+                    "last_lsn": lsn,
+                    "op": "insert",
+                    "rebuilt": False,
+                    "schema_version": rule_label,
+                }
                 inserted += 1
                 amount_audit[pk] = {"base": _numeric(after.get("amount")), "deltas": [], "mismatch": False}
 
@@ -125,15 +179,28 @@ def compute_merge(
             if pk in tombstones:
                 rebuilt += 1
                 tombstones.pop(pk)
-                rows[pk] = {"values": after, "last_lsn": lsn, "op": "update", "rebuilt": True}
+                rows[pk] = {
+                    "values": after,
+                    "last_lsn": lsn,
+                    "op": "update",
+                    "rebuilt": True,
+                    "schema_version": rule_label,
+                }
                 inserted += 1
                 amount_audit[pk] = {"base": _numeric(after.get("amount")), "deltas": [], "mismatch": False}
             elif pk not in rows:
-                rows[pk] = {"values": after, "last_lsn": lsn, "op": "update", "rebuilt": False}
+                rows[pk] = {
+                    "values": after,
+                    "last_lsn": lsn,
+                    "op": "update",
+                    "rebuilt": False,
+                    "schema_version": rule_label,
+                }
                 inserted += 1
                 amount_audit[pk] = {"base": _numeric(after.get("amount")), "deltas": [], "mismatch": False}
             else:
                 _merge_values(rows[pk], after, before, lsn, conflicts, pk)
+                rows[pk]["schema_version"] = rule_label
                 updated += 1
                 audit = amount_audit.setdefault(pk, {"base": None, "deltas": [], "mismatch": False})
                 before_amount = _numeric(before.get("amount"))
@@ -183,6 +250,7 @@ def compute_merge(
                 "op": "insert" if entry["op"] == "insert" else "update",
                 "last_lsn": entry["last_lsn"],
                 "rebuilt": entry["rebuilt"],
+                "schema_version": entry.get("schema_version"),
                 "values": entry["values"],
             }
         )
@@ -231,6 +299,15 @@ def compute_merge(
         "duplicates": duplicate_events,
         "rejected": rejected_events,
         "amount_audit": amount_result,
+        "schema_rules": [
+            {
+                "version_id": str(_rule_get(rule, "version_id")) if _rule_get(rule, "version_id") else None,
+                "version_label": _rule_get(rule, "version_label"),
+                "effective_from_lsn": _rule_get(rule, "effective_from_lsn"),
+            }
+            for rule in (schema_rules or [])
+        ],
+        "rule_selection": rule_counts,
         "digest": digest,
     }
 

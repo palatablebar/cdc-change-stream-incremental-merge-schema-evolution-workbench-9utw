@@ -24,8 +24,9 @@
 - **事件流看板**：流列表、水位线、积压量、按 op 的事件分布、最近运行。
 - **事件浏览**：按 op/拒绝标记筛选，按 LSN 序或到达序排列，单事件 before/after 字段级 diff（后端计算）。
 - **归并运行**：选 LSN 窗口 → 后端建 run → Celery worker 执行合并 → 结果落库 → 前端轮询结果。
-- **拒绝与重放**：4 类拒绝原因（`schema_mismatch / pk_missing / parse_error / type_conflict`），按原因做真实载荷修复后重放。
+- **拒绝与重放**：5 类拒绝原因（`schema_mismatch / pk_missing / parse_error / type_conflict / out_of_range`），按原因做真实载荷修复后重放；重放按**被拒绝事件自己的 LSN** 选择生效版本，老事件继续用老结构。
 - **schema 演进**：字段级 diff → 兼容等级（`full/backward/forward/breaking`）→ 前滚 SQL / 预检 SQL / 回滚 SQL / 发布步骤。
+- **版本发布与回退**：给新版本设置生效边界 LSN；发布前用目标表 / CDC 事件 / 归并结果等真实记录检查越界，坏记录单独隔离到拒绝队列；发布失败时保留原版本并把处理位置（水位线）恢复到发布前。页面展示版本生效边界、受影响订单和回退结果。
 - **横切**：JWT 三角色 RBAC、审计日志、Redis 滑动窗口限流（`runs` 桶 10 次/分钟）。
 
 ## 3. 两个核心算法（Python 真算，前端只展示）
@@ -52,8 +53,10 @@
 - 输入：两个 `SchemaVersion` 的字段集合（`name/type/nullable/default/is_pk`）。
 - 变更分类（10 类）：`add_nullable / add_required / add_required_with_default / drop_column / type_widen / type_narrow / type_incompatible / nullability_to_required / nullability_to_nullable / pk_change`。
 - 兼容口径：**backward** = 新 schema 能读旧数据；**forward** = 旧 schema 能读新数据；**breaking** = 都不成立。汇总取最差；`backward + forward` 混合也判 breaking（方向冲突）。
-- 输出：逐条 `compat`、汇总 `compat_level`、受影响列、前滚 SQL（含 `ADD COLUMN ... DEFAULT`、`ALTER COLUMN ... TYPE ... USING`）、预检 SQL、回滚 SQL、发布步骤。
-- demo 数据：orders 流 `v1 → v2` = `amount numeric(14,2) → numeric(12,2)`（type_narrow / **breaking**）+ 新增 `channel text`（add_nullable / **backward**），即 1 条 breaking + 1 条 backward。
+- 输出：逐条 `compat`、汇总 `compat_level`、受影响列、前滚 SQL（含 `ADD COLUMN ... DEFAULT`、`ALTER COLUMN ... TYPE ... USING`）、预检 SQL（按真实值检查越界）、回滚 SQL、发布步骤。
+- **按位点生效**：每个 `SchemaVersion` 带 `effective_from_lsn`。归并/重放时按事件的 LSN 选择 `effective_from_lsn <= lsn` 的最新版本；边界之前的老事件不会被新版本的收窄规则误伤。
+- **发布前真实记录预检**：`POST /api/schema/precheck` 与发布动作都会扫描真实记录（目标表、边界后的 CDC 事件、最近归并结果），越界记录以 `out_of_range` 进入拒绝队列；发布失败时版本状态和 `watermark_lsn` 一起回退，后续窗口不会沿用半完成结构。
+- demo 数据：orders 流 `v1 → v2` = `amount numeric(14,2) → numeric(12,2)`（type_narrow / **breaking**）+ 新增 `channel text`（add_nullable / **backward**），即 1 条 breaking + 1 条 backward；seed 中 v1 从 LSN 1 生效，v2 保持未发布，便于在页面选择生效边界后发布。
 
 ## 4. 快速启动
 
@@ -147,6 +150,7 @@ gb-547/
 | CdcOp (`insert/update/delete`) + 中文名 | `backend/src/constants/enums.py` | `frontend/src/constants/cdc.ts` |
 | StreamStatus / RunStatus | `backend/src/constants/enums.py` | `frontend/src/constants/cdc.ts` |
 | RejectReason / RejectStatus | `backend/src/constants/enums.py` | `frontend/src/constants/cdc.ts` |
+| SchemaVersionStatus / SchemaPublishStatus | `backend/src/constants/enums.py` | `frontend/src/constants/cdc.ts` |
 | ChangeKind（10 类） | `backend/src/constants/enums.py` | `frontend/src/constants/cdc.ts`、`frontend/src/constants/cdc.ts#CHANGE_KIND_TONE` |
 | CompatLevel (`full/backward/forward/breaking`) | `backend/src/constants/enums.py` | `frontend/src/constants/cdc.ts` |
 | MergeStrategy (`upsert/append`) | `backend/src/constants/enums.py` | `frontend/src/constants/cdc.ts` |

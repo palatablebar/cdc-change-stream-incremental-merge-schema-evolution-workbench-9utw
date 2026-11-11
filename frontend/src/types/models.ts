@@ -26,8 +26,10 @@ export type CdcOp = 'insert' | 'update' | 'delete';
 export type StreamStatus = 'healthy' | 'lagging' | 'paused' | 'error';
 export type RunStatus = 'queued' | 'running' | 'succeeded' | 'failed' | 'canceled';
 export type CompatLevel = 'full' | 'backward' | 'forward' | 'breaking';
-export type RejectReason = 'schema_mismatch' | 'pk_missing' | 'parse_error' | 'type_conflict';
+export type RejectReason = 'schema_mismatch' | 'pk_missing' | 'parse_error' | 'type_conflict' | 'out_of_range';
 export type RejectStatus = 'pending' | 'replayed' | 'dismissed';
+export type SchemaVersionStatus = 'draft' | 'active' | 'superseded' | 'rolled_back';
+export type SchemaPublishStatus = 'published' | 'failed' | 'rolled_back';
 
 export interface StreamSummary {
   event_total: number;
@@ -143,6 +145,7 @@ export interface MergeResult {
     op: string;
     last_lsn: number;
     rebuilt: boolean;
+    schema_version?: string | null;
     values: Record<string, unknown>;
   }>;
   conflicts: Array<{
@@ -156,6 +159,8 @@ export interface MergeResult {
   duplicates: Array<{ event_id: string; lsn: number; pk: string; kept_from: string | null }>;
   rejected: Array<{ event_id: string; lsn: number; pk: string | null; reason: string; detail: string }>;
   amount_audit: { checked: number; mismatched: number; items: AmountAuditItem[] };
+  schema_rules?: Array<{ version_id: string | null; version_label: string | null; effective_from_lsn: number | null }>;
+  rule_selection?: Record<string, number>;
   digest: string;
   idempotent?: boolean;
   executed_by?: string;
@@ -206,6 +211,12 @@ export interface SchemaVersion {
   fields: SchemaField[];
   field_count: number;
   ddl_summary: string;
+  effective_from_lsn: number | null;
+  effective_from_display: string | null;
+  effective_to_lsn: number | null;
+  status: SchemaVersionStatus;
+  status_label: string;
+  published_at: string | null;
   created_by: string;
   created_at: string;
 }
@@ -241,6 +252,95 @@ export interface SchemaDiff {
   target_table: string;
 }
 
+export interface SchemaBoundary {
+  version_id: string;
+  version_label: string;
+  effective_from_lsn: number;
+  effective_from_display: string;
+  effective_to_lsn: number | null;
+  status: SchemaVersionStatus;
+}
+
+export interface SchemaPrecheckViolation {
+  pk: string | null;
+  lsn: number | null;
+  source: string;
+  event_id: string | null;
+  column: string;
+  value: unknown;
+  type: string | null;
+  reason: string;
+  detail: string;
+}
+
+export interface SchemaPrecheck {
+  checked: number;
+  sources: string[];
+  violation_count: number;
+  affected_orders: string[];
+  affected_count: number;
+  violations: SchemaPrecheckViolation[];
+  version_label: string;
+  effective_from_lsn: number;
+  effective_from_display: string;
+  version?: SchemaVersion;
+  stream?: { id: string; name: string };
+}
+
+export interface SchemaPublishRollback {
+  performed: boolean;
+  reason: string | null;
+  restored_version_id: string | null;
+  restored_version_label: string | null;
+  restored_effective_from_lsn: number | null;
+  restored_watermark_lsn: number | null;
+  restored_watermark_display?: string | null;
+}
+
+export interface SchemaPublish {
+  id: string;
+  stream_id: string;
+  stream_name: string | null;
+  version_id: string;
+  version_label: string | null;
+  previous_version_id: string | null;
+  previous_version_label: string | null;
+  effective_from_lsn: number;
+  effective_from_display: string;
+  status: SchemaPublishStatus;
+  status_label: string;
+  precheck: SchemaPrecheck;
+  apply: {
+    applied?: boolean;
+    target_table?: string;
+    statements?: string[];
+    skipped?: string[];
+    reason?: string;
+    migration_sql?: string;
+    digest?: string;
+  };
+  rollback: SchemaPublishRollback;
+  quarantined_count: number;
+  watermark_before: number;
+  watermark_after: number;
+  watermark_after_display: string;
+  error_message: string | null;
+  triggered_by: string | null;
+  created_at: string | null;
+  finished_at: string | null;
+}
+
+export interface ReplayResult {
+  rejected: RejectedEvent;
+  new_event_id: string;
+  repair_note: string;
+  schema_version: string | null;
+  schema_version_id?: string | null;
+  effective_from_lsn?: number | null;
+  version_boundary_display?: string | null;
+  rule_selected_by?: string;
+}
+
 export interface RejectedEvent {
   id: string;
   event_id: string | null;
@@ -258,13 +358,6 @@ export interface RejectedEvent {
   replayed_event_id: string | null;
   created_at: string | null;
   resolved_at: string | null;
-}
-
-export interface ReplayResult {
-  rejected: RejectedEvent;
-  new_event_id: string;
-  repair_note: string;
-  schema_version: string | null;
 }
 
 export interface AuditLog {

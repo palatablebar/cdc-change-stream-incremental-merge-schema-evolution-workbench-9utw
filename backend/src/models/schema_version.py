@@ -4,7 +4,7 @@ import uuid
 from datetime import datetime
 from typing import Any
 
-from sqlalchemy import DateTime, String
+from sqlalchemy import BigInteger, DateTime, String
 from sqlalchemy.dialects.postgresql import JSONB, UUID
 from sqlalchemy.orm import Mapped, mapped_column
 
@@ -23,5 +23,11 @@ class SchemaVersion(Base):
     version_label: Mapped[str] = mapped_column(String(40), nullable=False)
     fields_json: Mapped[list[dict[str, Any]]] = mapped_column(JSONB, nullable=False, default=list)
     ddl_summary: Mapped[str] = mapped_column(String(2000), nullable=False, default="")
+    # 版本在哪个 LSN 之后生效；为空表示已登记但尚未发布
+    effective_from_lsn: Mapped[int | None] = mapped_column(BigInteger, nullable=True, index=True)
+    status: Mapped[str] = mapped_column(
+        String(20), nullable=False, default="draft", server_default="draft", index=True
+    )
+    published_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     created_by: Mapped[str] = mapped_column(String(120), nullable=False, default="")
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, nullable=False)

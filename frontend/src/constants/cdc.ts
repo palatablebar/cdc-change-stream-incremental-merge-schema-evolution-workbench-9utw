@@ -1,5 +1,15 @@
 /** 前端枚举第二份：与 backend/src/constants/enums.py 一一对应（README 有对照表）。 */
-import type { CdcOp, CompatLevel, RejectReason, RejectStatus, Role, RunStatus, StreamStatus } from '../types/models';
+import type {
+  CdcOp,
+  CompatLevel,
+  RejectReason,
+  RejectStatus,
+  Role,
+  RunStatus,
+  SchemaPublishStatus,
+  SchemaVersionStatus,
+  StreamStatus,
+} from '../types/models';
 
 export const STREAM_STATUS: Record<StreamStatus, { label: string; tone: 'ok' | 'warn' | 'muted' | 'danger' }> = {
   healthy: { label: '正常', tone: 'ok' },
@@ -27,6 +37,26 @@ export const REJECT_REASON: Record<RejectReason, { label: string; tone: 'danger'
   pk_missing: { label: '主键缺失', tone: 'danger' },
   parse_error: { label: '载荷解析失败', tone: 'amber' },
   type_conflict: { label: '类型冲突', tone: 'danger' },
+  out_of_range: { label: '数值/长度越界', tone: 'danger' },
+};
+
+export const SCHEMA_VERSION_STATUS: Record<
+  SchemaVersionStatus,
+  { label: string; tone: 'ok' | 'amber' | 'muted' | 'danger' }
+> = {
+  draft: { label: '未发布', tone: 'muted' },
+  active: { label: '生效中', tone: 'ok' },
+  superseded: { label: '已被覆盖', tone: 'amber' },
+  rolled_back: { label: '已回退', tone: 'danger' },
+};
+
+export const SCHEMA_PUBLISH_STATUS: Record<
+  SchemaPublishStatus,
+  { label: string; tone: 'ok' | 'amber' | 'danger' | 'muted' }
+> = {
+  published: { label: '已发布', tone: 'ok' },
+  failed: { label: '发布失败', tone: 'danger' },
+  rolled_back: { label: '已回退', tone: 'amber' },
 };
 
 export const REJECT_STATUS: Record<RejectStatus, { label: string; tone: 'ok' | 'amber' | 'muted' }> = {

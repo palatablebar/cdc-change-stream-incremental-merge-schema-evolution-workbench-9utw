@@ -6,6 +6,7 @@ from src.models.change_stream import ChangeStream
 from src.models.merge_run import MergeRun
 from src.models.merge_target import MergeTarget
 from src.models.rejected_event import RejectedEvent
+from src.models.schema_publish import SchemaPublish
 from src.models.schema_version import SchemaVersion
 from src.models.user import User
 
@@ -17,6 +18,7 @@ __all__ = [
     "MergeRun",
     "MergeTarget",
     "RejectedEvent",
+    "SchemaPublish",
     "SchemaVersion",
     "User",
     "metadata_obj",

@@ -12,6 +12,7 @@ import re
 from typing import Any
 
 from src.constants.enums import RejectReason
+from src.services.schema_engine import scalar_violation
 
 _NUMERIC_NOISE = re.compile(r"[¥$,\s]")
 
@@ -59,6 +60,8 @@ def repair_payload(
     """返回 (修复后的载荷 or None, 说明)。"""
     if reason == RejectReason.PK_MISSING.value:
         return None, "主键缺失属于业务事实缺失，不能自动重放"
+    if reason == RejectReason.OUT_OF_RANGE.value:
+        return None, "越界值不能靠重放猜测修正，需上游回补合法值或人工忽略"
     if not payload:
         return None, "原始载荷为空，无法重放"
 
@@ -72,6 +75,9 @@ def repair_payload(
             coerced, error = coerce_scalar(repaired[name], sql_type)
             if error:
                 return None, error
+            violation = scalar_violation(coerced, sql_type)
+            if violation:
+                return None, f"{name}: {violation['detail']}"
             if coerced is not None and coerced != repaired[name]:
                 notes.append(f"{name}: {repaired[name]!r}→{coerced!r}")
             repaired[name] = coerced
@@ -80,6 +86,9 @@ def repair_payload(
         # 缺字段：有默认值用它；可空补 None；必填无默认值 → 修复失败
         if field.get("default") is not None:
             repaired[name] = field["default"]
+            violation = scalar_violation(field["default"], sql_type)
+            if violation:
+                return None, f"{name}: {violation['detail']}"
             notes.append(f"{name}: 补默认值 {field['default']!r}")
         elif field.get("nullable", True):
             repaired[name] = None

@@ -55,7 +55,11 @@ export const RejectedPage = () => {
     try {
       const result = await rejectedApi.replay(item.id);
       setNote(
-        `重放成功：新事件 ${result.new_event_id.slice(0, 8)}，基于 schema ${result.schema_version ?? '—'}；修复说明：${result.repair_note}`,
+        `重放成功：新事件 ${result.new_event_id.slice(0, 8)}，按事件位点选用 schema ${result.schema_version ?? '—'}${
+          result.effective_from_lsn !== null && result.effective_from_lsn !== undefined
+            ? `（生效边界 ${result.version_boundary_display ?? result.effective_from_lsn}）`
+            : ''
+        }；修复说明：${result.repair_note}`,
       );
       await load();
     } catch (err) {

@@ -20,7 +20,76 @@ def list_versions(db: Session, stream_id: str) -> dict[str, Any]:
         .order_by(SchemaVersion.created_at.asc())
         .all()
     )
-    return {"items": [serialize_schema_version(row) for row in rows], "total": len(rows)}
+    serialized = [serialize_schema_version(row) for row in rows]
+    published = [
+        item
+        for item in serialized
+        if item["effective_from_lsn"] is not None
+        and item["status"] not in ("superseded", "rolled_back")
+    ]
+    published.sort(key=lambda item: int(item["effective_from_lsn"]))
+    boundaries = []
+    for index, item in enumerate(published):
+        effective_to = (
+            int(published[index + 1]["effective_from_lsn"]) - 1
+            if index + 1 < len(published)
+            else None
+        )
+        item["effective_to_lsn"] = effective_to
+        boundaries.append(
+            {
+                "version_id": item["id"],
+                "version_label": item["version_label"],
+                "effective_from_lsn": item["effective_from_lsn"],
+                "effective_from_display": item["effective_from_display"],
+                "effective_to_lsn": effective_to,
+                "status": item["status"],
+            }
+        )
+    current = published[-1] if published else None
+    return {
+        "items": serialized,
+        "total": len(serialized),
+        "effective_boundaries": boundaries,
+        "current_version": current,
+    }
+
+
+def load_version_rules(db: Session, stream_id: str) -> list[dict[str, Any]]:
+    """把一条流的全部版本裁成「按位点选规则」需要的结构（含未发布版本）。"""
+    rows = (
+        db.query(SchemaVersion)
+        .filter(SchemaVersion.stream_id == stream_id)
+        .order_by(SchemaVersion.created_at.asc())
+        .all()
+    )
+    return [
+        {
+            "version_id": str(row.id),
+            "version_label": row.version_label,
+            "effective_from_lsn": row.effective_from_lsn,
+            "status": row.status,
+            "fields": row.fields_json or [],
+        }
+        for row in rows
+    ]
+
+
+def effective_version(db: Session, stream_id: str, lsn: int) -> dict[str, Any]:
+    """按单个位点解析应使用的版本，供页面/接口核对「每条事件按自己的位点选规则」。"""
+    rows = (
+        db.query(SchemaVersion)
+        .filter(SchemaVersion.stream_id == stream_id)
+        .order_by(SchemaVersion.created_at.asc())
+        .all()
+    )
+    selected = schema_engine.resolve_version_for_lsn(rows, int(lsn))
+    return {
+        "stream_id": stream_id,
+        "lsn": int(lsn),
+        "rule_selected_by": "lsn",
+        "version": serialize_schema_version(selected) if selected is not None else None,
+    }
 
 
 def get_version(db: Session, version_id: str) -> SchemaVersion:

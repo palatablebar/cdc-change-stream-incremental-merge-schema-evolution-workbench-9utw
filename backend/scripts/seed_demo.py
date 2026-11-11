@@ -23,6 +23,7 @@ from src.constants.enums import (
     MergeStrategy,
     RejectStatus,
     RunStatus,
+    SchemaVersionStatus,
     StreamStatus,
 )
 from src.constants.roles import ROLE_ADMIN, ROLE_ENGINEER, ROLE_VIEWER
@@ -35,6 +36,7 @@ from src.models.rejected_event import RejectedEvent
 from src.models.schema_version import SchemaVersion
 from src.models.user import User
 from src.services.merge_engine import compute_merge
+from src.services.schema_service import load_version_rules
 from src.utils.password import hash_password
 
 DEMO_PASSWORD = "Demo@2026"
@@ -419,9 +421,13 @@ def seed_events(
     return created
 
 
-def seed_schema_versions(db, stream: ChangeStream, versions: list[tuple[str, list[dict], str, str]]) -> dict[str, SchemaVersion]:
+def seed_schema_versions(
+    db,
+    stream: ChangeStream,
+    versions: list[tuple[str, list[dict], str, str, str, int | None]],
+) -> dict[str, SchemaVersion]:
     result: dict[str, SchemaVersion] = {}
-    for label, fields, summary, created_by in versions:
+    for label, fields, summary, created_by, status, effective_from in versions:
         row = (
             db.query(SchemaVersion)
             .filter(SchemaVersion.stream_id == stream.id, SchemaVersion.version_label == label)
@@ -434,11 +440,19 @@ def seed_schema_versions(db, stream: ChangeStream, versions: list[tuple[str, lis
                 fields_json=fields,
                 ddl_summary=summary,
                 created_by=created_by,
+                status=status,
+                effective_from_lsn=effective_from,
+                published_at=datetime.now(timezone.utc) if effective_from is not None else None,
             )
             db.add(row)
             db.flush()
             _created("SchemaVersion", f"{stream.name}:{label}")
         else:
+            # 兼容从旧快照升级的库：老版本没有生效边界时补成 seed 口径。
+            if row.effective_from_lsn is None and effective_from is not None:
+                row.effective_from_lsn = effective_from
+                row.status = status
+                row.published_at = datetime.now(timezone.utc)
             _skipped("SchemaVersion", f"{stream.name}:{label}")
         result[label] = row
     db.commit()
@@ -512,6 +526,7 @@ def seed_merge_run(db, stream: ChangeStream, target: MergeTarget) -> MergeRun | 
         strategy=MergeStrategy.UPSERT.value,
         window_start=1,
         window_end=37,
+        schema_rules=load_version_rules(db, stream.id),
     )
     finished = datetime.now(timezone.utc)
 
@@ -680,14 +695,37 @@ def seed_all() -> dict[str, Any]:
             db,
             orders,
             [
-                ("v1", ORDERS_SCHEMA_V1, "order_id PK; amount numeric(14,2); status text NOT NULL DEFAULT 'pending'", "dba@cdc.local"),
-                ("v2", ORDERS_SCHEMA_V2, "新增 channel text；amount 收窄为 numeric(12,2)", "dba@cdc.local"),
+                (
+                    "v1",
+                    ORDERS_SCHEMA_V1,
+                    "order_id PK; amount numeric(14,2); status text NOT NULL DEFAULT 'pending'",
+                    "dba@cdc.local",
+                    SchemaVersionStatus.ACTIVE.value,
+                    1,
+                ),
+                (
+                    "v2",
+                    ORDERS_SCHEMA_V2,
+                    "新增 channel text；amount 收窄为 numeric(12,2)，等待发布",
+                    "dba@cdc.local",
+                    SchemaVersionStatus.DRAFT.value,
+                    None,
+                ),
             ],
         )
         seed_schema_versions(
             db,
             customers,
-            [("v1", CUSTOMERS_SCHEMA_V1, "customer_id PK; tier text NOT NULL DEFAULT 'basic'", "dba@cdc.local")],
+            [
+                (
+                    "v1",
+                    CUSTOMERS_SCHEMA_V1,
+                    "customer_id PK; tier text NOT NULL DEFAULT 'basic'",
+                    "dba@cdc.local",
+                    SchemaVersionStatus.ACTIVE.value,
+                    1,
+                )
+            ],
         )
 
         targets = seed_targets(db)

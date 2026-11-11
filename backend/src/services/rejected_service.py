@@ -71,13 +71,29 @@ def replay(db: Session, rejected_id: str) -> dict[str, Any]:
     if stream is None:
         raise not_found("ChangeStream", row.stream_id)
 
-    latest = (
+    versions = (
         db.query(SchemaVersion)
         .filter(SchemaVersion.stream_id == row.stream_id)
-        .order_by(SchemaVersion.created_at.desc())
-        .first()
+        .order_by(SchemaVersion.created_at.asc())
+        .all()
     )
-    fields = latest.fields_json if latest else []
+    # 关键：按被拒绝事件自己的 LSN 选版本，而不是无脑用最新结构。
+    # 边界之前的补传老事件必须继续按老版本的字段定义修复。
+    from src.services.schema_engine import resolve_version_for_lsn
+
+    selected = resolve_version_for_lsn(versions, int(row.lsn))
+    if selected is not None:
+        fields = selected.fields_json or []
+        version_label = selected.version_label
+        version_id = str(selected.id)
+        effective_from = selected.effective_from_lsn
+    else:
+        latest = versions[-1] if versions else None
+        fields = latest.fields_json if latest else []
+        version_label = latest.version_label if latest else None
+        version_id = str(latest.id) if latest else None
+        effective_from = latest.effective_from_lsn if latest else None
+
     payload = row.payload_json or {}
     after = dict(payload.get("after") or {})
 
@@ -121,7 +137,11 @@ def replay(db: Session, rejected_id: str) -> dict[str, Any]:
         "rejected": serialize_rejected(row, stream.name),
         "new_event_id": str(new_event.id),
         "repair_note": note,
-        "schema_version": latest.version_label if latest else None,
+        "schema_version": version_label,
+        "schema_version_id": version_id,
+        "effective_from_lsn": effective_from,
+        "version_boundary_display": f"{int(effective_from):012d}" if effective_from is not None else None,
+        "rule_selected_by": f"lsn={int(row.lsn)}",
     }
 
 
